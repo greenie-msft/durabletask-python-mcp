@@ -1,10 +1,35 @@
 # MCP Tasks with Durable Task SDK
 
-A demo showing how to use the **MCP Python SDK's experimental Tasks feature** backed by **Durable Task Scheduler**.
+A library and demo for building **durable, long-running MCP tools** backed by **Durable Task Scheduler**.
+
+## ✨ Quick Example
+
+```python
+from mcp_dts import DurableTaskServer
+
+mcp = DurableTaskServer("my-server", dts_host="localhost:8080")
+
+@mcp.durable_task(name="process_data", description="Process data in steps")
+def my_orchestration(ctx, input: dict):
+    for i in range(input.get("steps", 5)):
+        yield ctx.call_activity(do_step, input={"step": i})
+    return {"success": True}
+
+@mcp.activity
+def do_step(ctx, input: dict):
+    import time; time.sleep(1)
+    return {"completed": input["step"]}
+
+mcp.run()  # That's it!
+```
 
 ## 🎯 What This Does
 
-This project demonstrates the [MCP Tasks protocol](https://github.com/modelcontextprotocol/python-sdk/blob/main/docs/experimental/tasks.md) for async tool execution, using Durable Task SDK as the task persistence layer.
+This project provides:
+1. **`mcp_dts` library** - Simple decorators to add durable tasks to any MCP server
+2. **Working demo** - Complete server and client examples
+
+The [MCP Tasks protocol](https://github.com/modelcontextprotocol/python-sdk/blob/main/docs/experimental/tasks.md) enables async tool execution with polling:
 
 ```
 Client: call_tool_as_task("long_running_task", {...})
@@ -54,12 +79,19 @@ The `DurableTaskStore` implements the MCP SDK's `TaskStore` interface, bridging 
 
 ```
 src/
+├── mcp_dts/                # The library
+│   ├── __init__.py         # Exports DurableTaskServer, DurableTaskStore
+│   ├── server.py           # DurableTaskServer with decorators
+│   ├── store.py            # DurableTaskStore (TaskStore implementation)
+│   └── requirements.txt
+├── examples/
+│   └── simple_server.py    # Simple example using the library
 ├── mcp-server/
-│   ├── server.py           # MCP Tasks server with DurableTaskStore
-│   └── requirements.txt    # durabletask, mcp>=1.9.0, uvicorn, starlette
+│   ├── server.py           # Full demo server (manual implementation)
+│   └── requirements.txt
 └── client/
     ├── client.py           # MCP Tasks client demo
-    └── requirements.txt    # mcp>=1.9.0, httpx, httpx-sse
+    └── requirements.txt
 ```
 
 ## 🚀 Quick Start

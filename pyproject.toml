@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mcp-dts"
+version = "0.1.0"
+description = "MCP Server library with Durable Task SDK backend for long-running tasks"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [
+    {name = "Microsoft", email = "mcptools@microsoft.com"}
+]
+keywords = ["mcp", "durable-tasks", "orchestration", "long-running-tasks"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+dependencies = [
+    "mcp>=1.9.0",
+    "durabletask>=0.1.0",
+    "starlette>=0.27.0",
+    "uvicorn>=0.22.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-asyncio>=0.21",
+]
+
+[project.urls]
+Homepage = "https://github.com/microsoft/mcp-dts"
+Documentation = "https://github.com/microsoft/mcp-dts#readme"
+Repository = "https://github.com/microsoft/mcp-dts"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["mcp_dts*"]

@@ -33,11 +33,17 @@ async def main():
                     print(f"  - {tool.name}: taskSupport={tool.execution.taskSupport}")
             print()
             
-            # Call tool as task using the official SDK pattern
-            print("🚀 Calling long_running_task as task...")
+            # Use the first available task-required tool
+            task_tool = next((t for t in tools.tools if t.execution and t.execution.taskSupport == "required"), None)
+            if not task_tool:
+                print("No task-required tools found!")
+                return
+            
+            tool_name = task_tool.name
+            print(f"🚀 Calling {tool_name} as task...")
             result = await session.experimental.call_tool_as_task(
-                "long_running_task",
-                {"description": "Process important data", "steps": 5},
+                tool_name,
+                {"data": "Process important data", "steps": 5},
                 ttl=60000,  # 60 second TTL
             )
             
