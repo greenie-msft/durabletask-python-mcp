@@ -1,0 +1,10 @@
+# Durable Task SDK
+durabletask
+
+# MCP SDK
+mcp>=1.9.0
+
+# Server
+uvicorn
+starlette
+sse-starlette
