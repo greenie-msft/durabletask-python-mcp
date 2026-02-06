@@ -5,22 +5,22 @@ A library and demo for building **durable, long-running MCP tools** backed by **
 ## ✨ Quick Example
 
 ```python
-from mcp_dts import DurableTaskServer
+from mcp_dts import DurableTasks
 
-mcp = DurableTaskServer("my-server", dts_host="localhost:8080")
+durable_mcp = DurableTasks("my-server", dts_host="localhost:8080")
 
-@mcp.durable_task(name="process_data", description="Process data in steps")
+@durable_mcp.task(name="process_data", description="Process data in steps")
 def my_orchestration(ctx, input: dict):
     for i in range(input.get("steps", 5)):
         yield ctx.call_activity(do_step, input={"step": i})
     return {"success": True}
 
-@mcp.activity
+@durable_mcp.activity
 def do_step(ctx, input: dict):
     import time; time.sleep(1)
     return {"completed": input["step"]}
 
-mcp.run()  # That's it!
+durable_mcp.run()  # That's it!
 ```
 
 ## 🎯 What This Does
@@ -45,12 +45,73 @@ Client: get_task_result(task_id)
 Result: {"success": true, "results": [...]}
 ```
 
+## 📦 Two Usage Patterns
+
+### Option 1: Create a New Server
+
+Use `DurableTasks("name", ...)` to create a standalone MCP server with DTS support:
+
+```python
+from mcp_dts import DurableTasks
+
+durable_mcp = DurableTasks("my-server", dts_host="localhost:8080")
+
+@durable_mcp.task(name="analyze", description="Run analysis")
+def analyze(ctx, input: dict):
+    result = yield ctx.call_activity(do_work, input=input)
+    return {"done": True, "result": result}
+
+@durable_mcp.activity
+def do_work(ctx, input: dict):
+    return {"processed": True}
+
+durable_mcp.run()  # Starts MCP server + DTS worker
+```
+
+### Option 2: Add to an Existing Server
+
+Use `DurableTasks(existing_server, ...)` to add DTS support to an existing MCP server:
+
+```python
+from mcp.server import Server
+from mcp_dts import DurableTasks
+
+# Your existing MCP server
+server = Server("my-server")
+dts = DurableTasks(server, dts_host="localhost:8080")
+
+# Define task-backed tools
+@dts.task(name="analyze", description="Run analysis")
+def analyze(ctx, input: dict):
+    result = yield ctx.call_activity(do_work, input=input)
+    return {"done": True}
+
+@dts.activity
+def do_work(ctx, input: dict):
+    return {"processed": True}
+
+# Combine with your existing tools
+@server.list_tools()
+async def list_tools():
+    return my_other_tools + dts.get_task_tools()
+
+@server.call_tool()
+async def call_tool(name, arguments):
+    if name in [t.name for t in dts.get_task_tools()]:
+        return await dts.handle_task_tool(name, arguments)
+    # ... handle your other tools
+
+# Start worker, then run your server however you normally do
+dts.start_worker()
+# ... your normal server startup
+```
+
 ## 🏗️ Architecture
 
 ```
 ┌─────────────────┐     MCP Protocol      ┌─────────────────────────────┐
 │   MCP Client    │ ────────────────────▶ │                             │
-│   (client.py)   │ ◀──────────────────── │        server.py            │
+│   (client.py)   │ ◀──────────────────── │     DurableTasks class      │
 └─────────────────┘                       │                             │
                                           │   • MCP SDK + Tasks         │
                                           │   • Custom TaskStore        │
@@ -78,20 +139,16 @@ The `DurableTaskStore` implements the MCP SDK's `TaskStore` interface, bridging 
 ## 📁 Files
 
 ```
-src/
-├── mcp_dts/                # The library
-│   ├── __init__.py         # Exports DurableTaskServer, DurableTaskStore
-│   ├── server.py           # DurableTaskServer with decorators
-│   ├── store.py            # DurableTaskStore (TaskStore implementation)
-│   └── requirements.txt
-├── examples/
-│   └── simple_server.py    # Simple example using the library
-├── mcp-server/
-│   ├── server.py           # Full demo server (manual implementation)
-│   └── requirements.txt
-└── client/
-    ├── client.py           # MCP Tasks client demo
-    └── requirements.txt
+mcp_dts/                    # The library
+├── __init__.py             # Exports DurableTasks, DurableTaskStore
+├── server.py               # DurableTasks class with decorators
+├── store.py                # DurableTaskStore (TaskStore implementation)
+└── requirements.txt
+
+examples/                   # Working examples
+├── simple_server.py        # New server from scratch
+├── existing_server.py      # Add to existing server
+└── client.py               # MCP Tasks client demo
 ```
 
 ## 🚀 Quick Start
@@ -109,28 +166,28 @@ Dashboard: http://localhost:8082
 ### 2. Install Dependencies
 
 ```bash
-cd src/mcp-server
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
+pip install -r mcp_dts/requirements.txt
 ```
 
 ### 3. Start the Server
 
 ```bash
-python server.py
+cd examples
+python simple_server.py
 ```
 
 Output:
 ```
-Worker connecting to localhost:8080...
-MCP Tasks Server - DTS: localhost:8080, MCP: http://localhost:3000/sse
+Starting MCP Server with DTS backend...
+Dashboard: http://localhost:8082
+DTS Worker connecting to localhost:8080...
+MCP Server 'my-server' - DTS: localhost:8080, MCP: http://0.0.0.0:3000/sse
 ```
 
 ### 4. Run the Client
 
 ```bash
-cd src/client
+cd examples
 python client.py
 ```
 
@@ -139,10 +196,10 @@ Output:
 Connecting to http://localhost:3000/sse...
 ✅ Connected
 
-Tools: ['long_running_task']
-  - long_running_task: taskSupport=required
+Tools: ['process_data']
+  - process_data: taskSupport=required
 
-🚀 Calling long_running_task as task...
+🚀 Calling process_data as task...
    Task ID: abc-123
    Initial status: working
    Poll interval: 1000ms
@@ -150,11 +207,10 @@ Tools: ['long_running_task']
 🔄 Polling for status...
    working - RUNNING
    working - RUNNING
-   working - RUNNING
    completed - COMPLETED
 
 ✅ Task completed!
-Result: {"success": true, "description": "...", "results": [...]}
+Result: {"success": true, "steps_completed": 5, "results": [...]}
 ```
 
 ## 🔧 MCP Tasks SDK Usage
