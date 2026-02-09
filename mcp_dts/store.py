@@ -49,6 +49,8 @@ class DurableTaskStore(TaskStore):
             await loop.run_in_executor(self._executor, lambda: self._client.schedule_new_orchestration(
                 orchestrator, input=arguments, instance_id=task_id))
         
+        # MCP TaskStatus only supports: working, input_required, completed, failed, cancelled
+        # No 'created' status exists, so tasks start as 'working'
         return Task(taskId=task_id, status="working", createdAt=now, lastUpdatedAt=now, ttl=ttl, pollInterval=1000)
     
     async def get_task(self, task_id: str) -> Task | None:
@@ -69,8 +71,16 @@ class DurableTaskStore(TaskStore):
                        lastUpdatedAt=now, ttl=ttl, pollInterval=1000) if meta else None
         
         status_name = state.runtime_status.name if state.runtime_status else ""
-        status: TaskStatus = "completed" if status_name == "COMPLETED" else \
-                            "failed" if status_name == "FAILED" else "working"
+        # Map DTS states to MCP task statuses
+        # MCP TaskStatus only supports: working, input_required, completed, failed, cancelled
+        if status_name == "COMPLETED":
+            status: TaskStatus = "completed"
+        elif status_name == "FAILED":
+            status: TaskStatus = "failed"
+        elif status_name == "TERMINATED":
+            status: TaskStatus = "cancelled"
+        else:  # PENDING, RUNNING, or other
+            status: TaskStatus = "working"
         
         return Task(taskId=task_id, status=status, statusMessage=status_name,
                    createdAt=created_at, lastUpdatedAt=now, ttl=ttl, pollInterval=1000)

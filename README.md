@@ -290,6 +290,8 @@ def good_orchestration(ctx, input: dict):
 | `FAILED` | `failed` |
 | `TERMINATED` | `cancelled` |
 
+> **Note:** MCP TaskStatus only supports `working`, `input_required`, `completed`, `failed`, `cancelled`. There's no `created` status - tasks start as `working`.
+
 ## 📁 Project Structure
 
 ```
