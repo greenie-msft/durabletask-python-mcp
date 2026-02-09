@@ -38,14 +38,16 @@ durable_mcp_server = DurableTasks(mcp_server, dts_host="localhost:8080")
     input_schema={
         "type": "object",
         "properties": {
-            "query": {"type": "string", "description": "What to analyze"}
+            "query": {"type": "string", "description": "What to analyze"},
+            "steps": {"type": "integer", "description": "Number of steps (default: 5)", "default": 5}
         }
     }
 )
 def analysis_orchestration(ctx, input: dict):
     """Orchestration for long-running analysis."""
-    import random
-    num_steps = random.randint(5, 10)
+    # NOTE: Don't use random.randint() here - DTS orchestrations must be deterministic!
+    # Each replay would get a different value, causing infinite loops.
+    num_steps = input.get("steps", 5)  # Get from input instead
     results = []
     for i in range(num_steps):
         result = yield ctx.call_activity(do_analysis, input={
