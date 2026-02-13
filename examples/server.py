@@ -98,6 +98,12 @@ def do_final_processing(ctx, input: dict):
     return f"Final processing complete. {len(results)} results approved by {approver}."
 
 
+@durable_mcp_server.send_input
+async def send_task_input(task_id: str, data: dict):
+    """Send input to a task that is waiting for human input."""
+    pass
+
+
 # ----- Run the server -----
 
 async def main():

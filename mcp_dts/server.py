@@ -29,20 +29,6 @@ import uvicorn
 
 from .store import DurableTaskStore
 
-# Tool definition for sending input to waiting tasks
-SEND_TASK_INPUT_TOOL = Tool(
-    name="send_task_input",
-    description="Send input to a task that is waiting for human input (status: input_required). Returns the final result after the task completes.",
-    inputSchema={
-        "type": "object",
-        "properties": {
-            "task_id": {"type": "string", "description": "The task ID that is waiting for input"},
-            "data": {"type": "object", "description": "The input data to send to the task", "additionalProperties": True}
-        },
-        "required": ["task_id", "data"]
-    }
-)
-
 
 class DurableTasks:
     """
@@ -134,6 +120,10 @@ class DurableTasks:
         self._task_tools: list[Tool] = []
         self._orchestrators: dict[str, Callable] = {}  # tool_name -> orchestrator
         
+        # Registry of regular (non-task) tools
+        self._regular_tools: list[Tool] = []
+        self._tool_handlers: dict[str, Callable] = {}  # tool_name -> async handler
+        
         # Save any existing handlers before we register ours
         from mcp.types import ListToolsRequest, CallToolRequest
         self._existing_list_tools = self._server.request_handlers.get(ListToolsRequest)
@@ -206,6 +196,87 @@ class DurableTasks:
             return {"result": "done"}
         """
         self._worker.add_activity(func)
+        return func
+    
+    def send_input(self, func: Callable) -> Callable:
+        """
+        Decorator to register a send_task_input tool.
+        
+        Automatically creates an MCP tool that sends input to a waiting task,
+        polls for completion, and returns the result. The function name becomes
+        the tool name.
+        
+        @dts.send_input
+        async def send_task_input(task_id: str, data: dict):
+            \"\"\"Send input to a task that is waiting for human input.\"\"\"n            pass
+        """
+        import asyncio as _asyncio
+        import inspect
+        
+        tool_name = func.__name__
+        description = inspect.getdoc(func) or "Send input to a task waiting for human input."
+        store = self._store
+        
+        async def handler(arguments: dict):
+            task_id = arguments.get("task_id", "").strip()
+            data = arguments.get("data", {})
+            if not task_id:
+                return CallToolResult(
+                    content=[TextContent(type="text", text="Missing required parameter: task_id")],
+                    isError=True
+                )
+            
+            # Call the user's function for custom validation/logic
+            result = func(task_id, data) if not _asyncio.iscoroutinefunction(func) else await func(task_id, data)
+            # If user returns something, use it as a pre-check
+            if result is not None and result is not True:
+                return CallToolResult(
+                    content=[TextContent(type="text", text=str(result))],
+                    isError=True
+                )
+            
+            try:
+                store.send_input(task_id, data)
+            except Exception as e:
+                return CallToolResult(
+                    content=[TextContent(type="text", text=f"Failed to send input: {e}")],
+                    isError=True
+                )
+            
+            # Poll for completion
+            for _ in range(60):
+                await _asyncio.sleep(0.5)
+                task = await store.get_task(task_id)
+                if task and task.status == "completed":
+                    res = await store.get_result(task_id)
+                    text = res.content[0].text if res and res.content else "Done"
+                    return CallToolResult(
+                        content=[TextContent(type="text", text=f"Task completed!\n\nResult: {text}")]
+                    )
+                if task and task.status == "failed":
+                    return CallToolResult(
+                        content=[TextContent(type="text", text=f"Task failed: {task.statusMessage}")],
+                        isError=True
+                    )
+            return CallToolResult(
+                content=[TextContent(type="text", text=f"Input sent to task {task_id}. Still processing.")]
+            )
+        
+        tool = Tool(
+            name=tool_name,
+            description=description,
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "task_id": {"type": "string", "description": "The task ID waiting for input"},
+                    "data": {"type": "object", "description": "The input data to send", "additionalProperties": True}
+                },
+                "required": ["task_id", "data"]
+            },
+        )
+        self._regular_tools.append(tool)
+        self._tool_handlers[tool_name] = handler
+        
         return func
     
     def create_input_waiter(self, event_name: str = "user_input"):
@@ -329,10 +400,7 @@ class DurableTasks:
     
     async def _list_tools(self) -> list[Tool]:
         """List tools handler - chains to existing handler if present."""
-        tools = list(self._task_tools)
-        
-        # Add send_task_input tool for human-in-the-loop support
-        tools.append(SEND_TASK_INPUT_TOOL)
+        tools = list(self._task_tools) + list(self._regular_tools)
         
         # Chain to existing handler if there was one
         if self._existing_list_tools:
@@ -352,9 +420,19 @@ class DurableTasks:
         if name in self._orchestrators:
             return await self.handle_task_tool(name, arguments)
         
-        # Handle send_task_input for human-in-the-loop
-        if name == "send_task_input":
-            return await self._handle_send_task_input(arguments)
+        # Handle regular tools
+        if name in self._tool_handlers:
+            result = await self._tool_handlers[name](arguments)
+            if isinstance(result, CallToolResult):
+                return result
+            # Allow returning a list of content dicts for convenience
+            if isinstance(result, list):
+                return CallToolResult(
+                    content=[TextContent(type="text", text=item["text"]) if isinstance(item, dict) else item for item in result]
+                )
+            return CallToolResult(
+                content=[TextContent(type="text", text=str(result))]
+            )
         
         # Chain to existing handler for other tools
         if self._existing_call_tool:
@@ -372,58 +450,6 @@ class DurableTasks:
         return CallToolResult(
             content=[TextContent(type="text", text=f"Unknown tool: {name}")],
             isError=True
-        )
-    
-    async def _handle_send_task_input(self, arguments: dict) -> CallToolResult:
-        """Handle send_task_input tool call to resume a waiting task."""
-        task_id = arguments.get("task_id")
-        data = arguments.get("data", {})
-        
-        if not task_id:
-            return CallToolResult(
-                content=[TextContent(type="text", text="Missing required parameter: task_id")],
-                isError=True
-            )
-        
-        # Send the input (raises DTS external event)
-        # This works even after server restart - DTS tracks orchestration state
-        try:
-            self._store.send_input(task_id, data)
-        except Exception as e:
-            return CallToolResult(
-                content=[TextContent(type="text", text=f"Failed to send input to task {task_id}: {e}")],
-                isError=True
-            )
-        
-        # Wait for orchestration to complete (poll DTS)
-        import time
-        max_wait = 30  # seconds
-        poll_interval = 0.5
-        elapsed = 0
-        
-        while elapsed < max_wait:
-            await asyncio.sleep(poll_interval)
-            elapsed += poll_interval
-            
-            task = await self._store.get_task(task_id)
-            if task and task.status == "completed":
-                # Get the result
-                result = await self._store.get_result(task_id)
-                if result and result.content:
-                    return CallToolResult(
-                        content=[TextContent(type="text", text=f"Task completed!\n\nResult: {result.content[0].text}")]
-                    )
-                return CallToolResult(
-                    content=[TextContent(type="text", text=f"Task {task_id} completed.")]
-                )
-            elif task and task.status == "failed":
-                return CallToolResult(
-                    content=[TextContent(type="text", text=f"Task {task_id} failed: {task.statusMessage}")],
-                    isError=True
-                )
-        
-        return CallToolResult(
-            content=[TextContent(type="text", text=f"Input sent to task {task_id}. Task is still processing (check status later).")]
         )
     
     def run(self, host: str = "0.0.0.0", port: int = 3000):
