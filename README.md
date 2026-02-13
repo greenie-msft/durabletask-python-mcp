@@ -1,390 +1,221 @@
-# MCP Tasks with Durable Task SDK
+# Durable Task MCP Integration (Python)
 
-A library for building **durable, long-running MCP tools** backed by **Durable Task Scheduler**.
+A prototype implementation of the [MCP Task specification][mcp-tasks] using the
+[Durable Task SDK for Python][dt-sdk] with the
+[Durable Task Scheduler (DTS)][dts] as the backend.
 
-## 🎯 Why Durable Task SDK?
+[mcp-tasks]: https://modelcontextprotocol.io/specification/draft/basic/utilities/tasks
+[dt-sdk]: https://github.com/microsoft/durabletask-python
+[dts]: https://learn.microsoft.com/azure/azure-functions/durable/durable-task-scheduler/durable-task-scheduler
 
-MCP's [Tasks protocol](https://github.com/modelcontextprotocol/python-sdk/blob/main/docs/experimental/tasks.md) enables tools to run asynchronously - the client starts a task, polls for status, and retrieves results when complete. But **where does the task state live?**
+## Overview
 
-That's where **Durable Task SDK** comes in:
+This project bridges [MCP Tasks][mcp-tasks] and [Durable Task][dt-sdk]
+orchestrations, enabling MCP server developers to build reliable, observable,
+long-running tools backed by the Durable Task Scheduler. An MCP tool is mapped
+to a Durable Task orchestration or activity, and the library handles all
+protocol details automatically.
 
-| Challenge | How Durable Task SDK Solves It |
-|-----------|-------------------------------|
-| **State Persistence** | Orchestration state is stored in Durable Task Scheduler, surviving server restarts |
-| **Long-Running Work** | Break work into activities that can take minutes, hours, or days |
-| **Reliability** | Automatic retry and checkpointing - work resumes exactly where it left off |
-| **Scalability** | Workers can scale horizontally; scheduler distributes work |
-| **Observability** | Built-in dashboard to view running orchestrations and their history |
+### Why Durable Task?
 
-### What is Durable Task Scheduler?
+- **Reliability** — Task state is durably persisted in DTS. Orchestrations automatically resume
+  after server restarts without losing progress.
+- **Observability** — The built-in [DTS Dashboard][dts-dashboard] provides real-time visibility
+  into task execution history, timelines, inputs/outputs, and failure details.
+- **Scalability** — DTS is a managed service that scales independently of the MCP server.
+- **Rich execution models** — Simple single-activity tools and complex multi-step orchestrations
+  with human-in-the-loop approval, all using the same programming model.
 
-[Durable Task Scheduler](https://learn.microsoft.com/azure/azure-functions/durable/durable-functions-overview) is a managed Azure service (also available as a local emulator) that:
+[dts-dashboard]: https://learn.microsoft.com/azure/azure-functions/durable/durable-task-scheduler/durable-task-scheduler-dashboard
 
-- **Persists orchestration state** - Every step is checkpointed
-- **Manages the work queue** - Distributes activities to workers
-- **Handles replay** - When an orchestration resumes, it replays from the beginning using saved state
-- **Provides a dashboard** - Visual UI to monitor running tasks
+## How It Works
 
-For local development, we use the **DTS Emulator** - a Docker container that provides the same functionality.
+```text
+MCP Client ──► MCP Server (Python)
+                    │
+               TaskStore
+                    │
+              DurableTaskStore ◄── maps MCP lifecycle to orchestrations
+                    │
+               DurableTaskClient
+                    │
+              ┌─────┴──────┐
+              │    DTS      │  (Emulator or Azure)
+              └────────────┘
+```
 
-## ✨ Quick Example
+Each MCP tool registered via `@durable_mcp.task()` gets an internal orchestration
+that handles MCP protocol concerns (TTL, status reporting, human-in-the-loop).
+Developers write plain Durable Task code with no MCP boilerplate.
+
+### Concept Mapping
+
+| MCP Task Concept    | Durable Task Concept                  |
+| ------------------- | ------------------------------------- |
+| Task ID             | Orchestration Instance ID             |
+| Task Lifecycle      | Orchestration Lifecycle               |
+| `working`           | `Pending` or `Running`                |
+| `input_required`    | `Running` + custom status             |
+| `completed`         | `Completed`                           |
+| `failed`            | `Failed`                              |
+| `cancelled`         | `Terminated`                          |
+| Task Status Message | Custom Status                         |
+| Elicitation         | `wait_for_external_event` + custom status |
+| List Tasks          | List Orchestrations                   |
+| Cancel Task         | Terminate Orchestration               |
+
+## Programming Model
+
+Register orchestrations and activities as MCP tools using decorators:
 
 ```python
+from mcp.server import Server
 from mcp_dts import DurableTasks
 
-# Create MCP server with DTS backend
-durable_mcp = DurableTasks("my-server", dts_host="localhost:8080")
+server = Server("my-server")
+dts = DurableTasks(server, dts_host="localhost:8080")
 
-@durable_mcp.task(name="process_data", description="Process data in steps")
-def my_orchestration(ctx, input: dict):
-    """Orchestration: coordinates the workflow."""
-    results = []
-    for i in range(input.get("steps", 5)):
-        # Each activity is checkpointed - if server restarts, it resumes here
-        result = yield ctx.call_activity(do_step, input={"step": i})
-        results.append(result)
-    return {"success": True, "results": results}
+# Create human-in-the-loop helper
+wait_for_approval = dts.create_input_waiter("approval")
 
-@durable_mcp.activity
-def do_step(ctx, input: dict):
-    """Activity: does the actual work."""
+
+@dts.task(
+    name="purchase_order",
+    description="Submit a purchase order. Orders over $1,000 require approval.",
+    input_schema={
+        "type": "object",
+        "properties": {
+            "item": {"type": "string"},
+            "amount": {"type": "number"},
+            "item_count": {"type": "integer", "default": 1},
+        },
+    },
+)
+def purchase_order_orchestration(ctx, input: dict):
+    amount = input.get("amount", 0)
+    item_count = input.get("item_count", 1)
+
+    # Validate the order
+    yield ctx.call_activity(validate_order, input=input)
+
+    if amount > 1000:
+        # Pauses the task and sets status to "input_required"
+        decision = yield from wait_for_approval(
+            ctx,
+            message=f"Approve order for ${amount}?",
+        )
+        if not decision.get("approved"):
+            return "Order rejected."
+
+    # Process items
+    yield ctx.call_activity(process_items, input={"count": item_count})
+    return "Order completed."
+
+
+@dts.activity
+def validate_order(ctx, input: dict):
+    """Validate the order details."""
+    return True
+
+
+@dts.activity
+def process_items(ctx, input: dict):
+    """Process items in the order."""
     import time
-    time.sleep(1)  # Simulate work
-    return f"Completed step {input['step']}"
-
-durable_mcp.run()  # Starts MCP server + DTS worker
+    time.sleep(1)
+    return input.get("count", 1)
 ```
 
-## 🔄 How It Works
+Orchestrations use standard Durable Task APIs:
 
-```
-Client                          MCP Server                    DTS Scheduler
-  │                                 │                              │
-  │  call_tool_as_task()            │                              │
-  ├────────────────────────────────▶│  schedule_new_orchestration()│
-  │                                 ├─────────────────────────────▶│
-  │  CreateTaskResult(task_id)      │                              │
-  │◀────────────────────────────────┤                              │
-  │                                 │                              │
-  │  poll_task(task_id)             │  get_instance_state()        │
-  ├────────────────────────────────▶├─────────────────────────────▶│
-  │  status: "working"              │◀─────────────────────────────┤
-  │◀────────────────────────────────┤                              │
-  │         ...                     │         ...                  │
-  │                                 │                              │
-  │  poll_task(task_id)             │  get_instance_state()        │
-  ├────────────────────────────────▶├─────────────────────────────▶│
-  │  status: "completed"            │◀─────────────────────────────┤
-  │◀────────────────────────────────┤                              │
-  │                                 │                              │
-  │  get_task_result(task_id)       │  get serialized output       │
-  ├────────────────────────────────▶├─────────────────────────────▶│
-  │  {"success": true, ...}         │◀─────────────────────────────┤
-  │◀────────────────────────────────┤                              │
-```
+- `yield ctx.call_activity(fn, input={...})` — Call an activity and checkpoint.
+- `yield from wait_for_approval(ctx, message="...")` — Set `input_required` status and durably wait for external input.
+- Return a value to complete the task.
 
-### The Key Components
+## Samples
 
-| Component | Role |
-|-----------|------|
-| **MCP Server** | Handles MCP protocol, exposes tools to clients |
-| **DurableTasks** | Bridges MCP Tasks API to Durable Task SDK |
-| **DTS Worker** | Executes orchestrations and activities |
-| **DTS Scheduler** | Persists state, manages work queue, handles replay |
-| **DurableTaskStore** | Implements MCP's `TaskStore` interface using DTS |
+The example server exposes an `analysis_with_approval` tool demonstrating the
+full MCP Task lifecycle, including human-in-the-loop approval. See
+[examples/](examples/) for step-by-step instructions on testing with the
+[MCP Inspector][inspector].
 
-## 🚀 Running the Example
+[inspector]: https://modelcontextprotocol.io/docs/tools/inspector
+
+| Sample | Transport | Description |
+| --- | --- | --- |
+| [examples/server.py](examples/server.py) | SSE | MCP server on `http://localhost:3000/sse` |
+| [examples/client.py](examples/client.py) | SSE | CLI client demonstrating Tasks API and approval flow |
 
 ### Prerequisites
 
-- Python 3.10+
-- Docker (for the DTS Emulator)
+- [Python 3.10+](https://www.python.org/downloads/)
+- [Docker](https://www.docker.com/) (for the DTS emulator)
+- [Node.js](https://nodejs.org/) (for the MCP Inspector)
 
-### 1. Start the DTS Emulator
+### Quick Start
 
 ```bash
+# 1. Start the DTS emulator
 docker run -d -p 8080:8080 -p 8082:8082 \
   --name dts-emulator \
-  cgillum/durabletask-emulator
-```
+  mcr.microsoft.com/dts/dts-emulator:latest
 
-- **Port 8080**: gRPC endpoint (workers connect here)
-- **Port 8082**: Dashboard UI
-
-Open the dashboard: http://localhost:8082
-
-### 2. Install the Library
-
-```bash
-cd /path/to/mcp-dts
+# 2. Install the library
 pip install -e .
-```
 
-### 3. Run the Server
-
-```bash
+# 3. Run the server
 cd examples
 python server.py
 ```
 
-You'll see:
-```
-Starting existing server with DTS support...
-Dashboard: http://localhost:8082
-MCP: http://localhost:3000/sse
-DTS Worker connecting to localhost:8080...
-```
+Open the DTS Dashboard at http://localhost:8082 to observe orchestrations.
 
-### 4. Run the Client
-
-In another terminal:
+To test with the MCP Inspector:
 
 ```bash
-cd examples
-python client.py
+npx @modelcontextprotocol/inspector
 ```
 
-Output:
-```
-Connecting to http://localhost:3000/sse...
-✅ Connected
+Connect to `http://localhost:3000/sse`, then invoke the `analysis_with_approval`
+tool from the Tools tab.
 
-Tools: ['long_running_analysis']
-  - long_running_analysis: taskSupport=required
+## Configuration
 
-🚀 Calling long_running_analysis as task...
-   Task ID: aba6e209-8322-4a44-8f61-b55b41c4bc5a
-   Initial status: working
-   Poll interval: 1000ms
+The DTS connection is configured via constructor arguments:
 
-🔄 Polling for status...
-   working - RUNNING
-   working - RUNNING
-   working - RUNNING
-   completed - COMPLETED
+| Parameter | Default | Description |
+| --- | --- | --- |
+| `dts_host` | `localhost:8080` | DTS gRPC endpoint |
+| `taskhub` | `default` | DTS task hub name |
 
-✅ Task completed!
-Result: {"analysis_complete": true, "steps": 5, "results": [...]}
-```
+| Environment | `dts_host` value |
+| --- | --- |
+| Local emulator | `localhost:8080` |
+| Azure DTS | `<name>.westus2.durabletask.io` |
 
-### 5. View in Dashboard
+## Project Structure
 
-Open http://localhost:8082 to see:
-- Running and completed orchestrations
-- Execution history for each orchestration
-- Activity inputs and outputs
-
-## 📦 Two Usage Patterns
-
-### Option 1: Create a New Server
-
-```python
-from mcp_dts import DurableTasks
-
-durable_mcp = DurableTasks("my-server", dts_host="localhost:8080")
-
-@durable_mcp.task(name="analyze", description="Run analysis")
-def analyze(ctx, input: dict):
-    result = yield ctx.call_activity(do_work, input=input)
-    return {"done": True, "result": result}
-
-@durable_mcp.activity
-def do_work(ctx, input: dict):
-    return {"processed": True}
-
-durable_mcp.run()  # Starts MCP server + DTS worker
-```
-
-### Option 2: Add to an Existing Server
-
-```python
-from mcp.server import Server
-from mcp_dts import DurableTasks
-
-# Your existing MCP server
-server = Server("my-server")
-
-# Wrap with DTS support - automatically chains to existing handlers
-dts = DurableTasks(server, dts_host="localhost:8080")
-
-@dts.task(name="analyze", description="Run analysis")
-def analyze(ctx, input: dict):
-    result = yield ctx.call_activity(do_work, input=input)
-    return {"done": True}
-
-@dts.activity
-def do_work(ctx, input: dict):
-    return {"processed": True}
-
-# Start worker, then run your server however you normally do
-dts.start_worker()
-# ... your normal server startup
-```
-
-## ⚠️ Critical: Orchestration Determinism
-
-**Orchestrations MUST be deterministic.** DTS replays orchestrations from the beginning after each activity completes, using saved state. Non-deterministic code causes infinite replay loops.
-
-### ❌ Don't Do This
-
-```python
-@durable_mcp.task(name="bad_task")
-def bad_orchestration(ctx, input: dict):
-    import random
-    steps = random.randint(5, 10)  # ❌ Different value on each replay!
-    for i in range(steps):
-        yield ctx.call_activity(do_work, input={"step": i})
-```
-
-### ✅ Do This Instead
-
-```python
-@durable_mcp.task(name="good_task")
-def good_orchestration(ctx, input: dict):
-    steps = input.get("steps", 5)  # ✅ Deterministic from input
-    for i in range(steps):
-        yield ctx.call_activity(do_work, input={"step": i})
-```
-
-**Rule of thumb:** Anything non-deterministic (`random`, `datetime.now()`, `uuid.uuid4()`) should be:
-1. Passed as input to the orchestration, or
-2. Generated inside an activity (activities run once, not replayed)
-
-## 🏗️ Architecture
-
-```
-┌─────────────────┐     MCP Protocol      ┌─────────────────────────────┐
-│   MCP Client    │ ────────────────────▶ │                             │
-│   (client.py)   │ ◀──────────────────── │     DurableTasks class      │
-└─────────────────┘                       │                             │
-                                          │   • MCP SDK + Tasks         │
-                                          │   • DurableTaskStore        │
-                                          │   • Durable Task SDK        │
-                                          └──────────────┬──────────────┘
-                                                         │ gRPC
-                                                         ▼
-                                          ┌─────────────────────────────┐
-                                          │   DTS Emulator (Docker)     │
-                                          │   • Persists workflow state │
-                                          │   • Manages work queue      │
-                                          │   • Dashboard UI            │
-                                          └─────────────────────────────┘
-```
-
-### How DurableTaskStore Bridges MCP and DTS
-
-| MCP Operation | DurableTaskStore Implementation |
-|---------------|--------------------------------|
-| `create_task(metadata)` | Schedules a DTS orchestration |
-| `get_task(task_id)` | Queries orchestration state, maps to MCP status |
-| `get_result(task_id)` | Returns serialized orchestration output |
-| `cancel_task(task_id)` | Terminates the orchestration |
-
-### State Mapping
-
-| DTS State | MCP Status |
-|-----------|------------|
-| `PENDING` | `working` |
-| `RUNNING` | `working` |
-| `COMPLETED` | `completed` |
-| `FAILED` | `failed` |
-| `TERMINATED` | `cancelled` |
-
-> **Note:** MCP TaskStatus only supports `working`, `input_required`, `completed`, `failed`, `cancelled`. There's no `created` status - tasks start as `working`.
-
-## 📁 Project Structure
-
-```
-mcp-dts/
-├── mcp_dts/                    # The library
-│   ├── __init__.py             # Exports DurableTasks, DurableTaskStore
-│   ├── server.py               # DurableTasks class with decorators
-│   └── store.py                # DurableTaskStore (TaskStore → DTS)
-│
-├── examples/                   # Working examples
-│   ├── server.py               # MCP server with task-backed tools
-│   └── client.py               # MCP client demonstrating Tasks API
-│
-├── pyproject.toml              # Package configuration
+```text
+├── mcp_dts/                        # Core library (pip package)
+│   ├── __init__.py                 # Exports DurableTasks, DurableTaskStore
+│   ├── server.py                   # DurableTasks class — decorators, tool registration
+│   └── store.py                    # DurableTaskStore — TaskStore → DTS mapping
+├── examples/
+│   ├── server.py                   # SSE server with human-in-the-loop demo
+│   └── client.py                   # CLI client with approval flow
+├── pyproject.toml                  # Package configuration
 └── README.md
 ```
 
-## 📊 Task States
+## References
 
-| Status | Meaning |
-|--------|---------|
-| `working` | Task is running or pending |
-| `completed` | Done successfully |
-| `failed` | Error occurred |
-| `cancelled` | Terminated by user |
-
-## 🔗 Connect to VS Code / GitHub Copilot
-
-Add to your VS Code settings:
-
-```json
-{
-  "mcp.servers": {
-    "durable-tasks": {
-      "url": "http://localhost:3000/sse"
-    }
-  }
-}
-```
-
-## 📚 References
-
-- [MCP Tasks Overview](https://github.com/modelcontextprotocol/python-sdk/blob/main/docs/experimental/tasks.md)
-- [MCP Tasks Server Guide](https://github.com/modelcontextprotocol/python-sdk/blob/main/docs/experimental/tasks-server.md)
-- [MCP Tasks Client Guide](https://github.com/modelcontextprotocol/python-sdk/blob/main/docs/experimental/tasks-client.md)
+- [MCP Task Specification](https://modelcontextprotocol.io/specification/draft/basic/utilities/tasks)
 - [Durable Task Python SDK](https://github.com/microsoft/durabletask-python)
-- [Durable Task Scheduler](https://learn.microsoft.com/azure/azure-functions/durable/durable-functions-overview)
-- [DTS Emulator](https://github.com/cgillum/durabletask-emulator)
+- [Durable Task Scheduler](https://learn.microsoft.com/azure/azure-functions/durable/durable-task-scheduler/durable-task-scheduler)
+- [DTS Dashboard](https://learn.microsoft.com/azure/azure-functions/durable/durable-task-scheduler/durable-task-scheduler-dashboard)
+- [.NET implementation of this same POC](https://github.com/cgillum/durabletask-dotnet-mcp)
 
-## 🔮 Future: Making DTS the Default for MCP Tasks in Azure
+## License
 
-If Durable Task SDK and Scheduler were to become the default for long-running MCP tasks in Azure:
-
-### SDK Improvements
-
-| Area | Improvement |
-|------|-------------|
-| **Ready-to-use TaskStore** | Provide `DurableTaskStore` in MCP SDK or as a package |
-| **Auto-start worker** | Start DTS worker automatically when MCP server initializes |
-| **Environment-based config** | Auto-discover from `DTS_ENDPOINT`, `DTS_TASKHUB` |
-
-### Azure Integration
-
-| Area | Improvement |
-|------|-------------|
-| **Managed Identity** | Auto-detect Azure identity for DTS auth |
-| **One-click provisioning** | Deploy DTS alongside MCP server resources |
-| **Built-in monitoring** | Correlate MCP requests with DTS orchestrations in App Insights |
-
-### Developer Experience
-
-| Area | Improvement |
-|------|-------------|
-| **Local dev** | `azd up` auto-starts DTS emulator |
-| **Simplified decorators** | `@mcp.orchestration` that auto-registers with DTS |
-| **Progress reporting** | Standard `task.progress` field with percentage and message |
-
-### Example: Ideal Future API
-
-```python
-from mcp.server import Server
-from mcp.durable import durable_task  # Future package
-
-mcp = Server("my-server")
-mcp.enable_durable_tasks()  # One line to enable
-
-@mcp.tool(task_required=True)
-@durable_task
-async def process_data(ctx, data: str, steps: int = 5):
-    """A long-running task backed by DTS."""
-    for i in range(steps):
-        result = await ctx.call_activity(do_step, step=i)
-        await ctx.report_progress(i / steps, f"Step {i+1}/{steps}")
-    return {"success": True}
-```
+MIT
 
