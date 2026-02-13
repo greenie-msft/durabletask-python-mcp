@@ -29,6 +29,20 @@ import uvicorn
 
 from .store import DurableTaskStore
 
+# Tool definition for sending input to waiting tasks
+SEND_TASK_INPUT_TOOL = Tool(
+    name="send_task_input",
+    description="Send input to a task that is waiting for human input (status: input_required). Returns the final result after the task completes.",
+    inputSchema={
+        "type": "object",
+        "properties": {
+            "task_id": {"type": "string", "description": "The task ID that is waiting for input"},
+            "data": {"type": "object", "description": "The input data to send to the task", "additionalProperties": True}
+        },
+        "required": ["task_id", "data"]
+    }
+)
+
 
 class DurableTasks:
     """
@@ -194,6 +208,57 @@ class DurableTasks:
         self._worker.add_activity(func)
         return func
     
+    def create_input_waiter(self, event_name: str = "user_input"):
+        """
+        Create a helper for human-in-the-loop patterns.
+        
+        Returns a function to use with ``yield from`` inside an orchestration.
+        It marks the task as ``input_required`` in the MCP task store,
+        then durably waits for an external event.
+        
+        Usage in orchestration::
+        
+            wait_for_approval = dts.create_input_waiter("approval")
+            
+            # Do some work...
+            result = yield ctx.call_activity(do_analysis, input=data)
+            
+            # Request human approval (single call)
+            approval = yield from wait_for_approval(
+                ctx,
+                message="Please approve the analysis results",
+                data={"results": result},
+            )
+            
+            if approval.get("approved"):
+                ...
+        """
+        store = self._store
+        
+        @self.activity
+        def _mark_waiting_for_input(ctx, input: dict):
+            """Activity that marks the orchestration as waiting for input."""
+            instance_id = ctx.orchestration_id
+            message = input.get("message", f"Waiting for {event_name}")
+            schema = input.get("schema", {"type": "object"})
+            store.mark_waiting_for_input(instance_id, event_name, message, schema)
+            return {"status": "waiting", "event_name": event_name}
+        
+        def _wait_for_input(ctx, message: str = "", data=None, schema=None):
+            """Mark the task as waiting and suspend until input arrives.
+            
+            Use with ``yield from`` inside an orchestration.
+            """
+            yield ctx.call_activity(_mark_waiting_for_input, input={
+                "message": message or f"Waiting for {event_name}",
+                "data": data,
+                "schema": schema or {"type": "object"},
+            })
+            result = yield ctx.wait_for_external_event(event_name)
+            return result
+        
+        return _wait_for_input
+    
     def get_task_tools(self) -> list[Tool]:
         """
         Get the list of task-backed tools.
@@ -266,6 +331,9 @@ class DurableTasks:
         """List tools handler - chains to existing handler if present."""
         tools = list(self._task_tools)
         
+        # Add send_task_input tool for human-in-the-loop support
+        tools.append(SEND_TASK_INPUT_TOOL)
+        
         # Chain to existing handler if there was one
         if self._existing_list_tools:
             from mcp.types import ListToolsRequest
@@ -284,6 +352,10 @@ class DurableTasks:
         if name in self._orchestrators:
             return await self.handle_task_tool(name, arguments)
         
+        # Handle send_task_input for human-in-the-loop
+        if name == "send_task_input":
+            return await self._handle_send_task_input(arguments)
+        
         # Chain to existing handler for other tools
         if self._existing_call_tool:
             from mcp.types import CallToolRequest
@@ -300,6 +372,58 @@ class DurableTasks:
         return CallToolResult(
             content=[TextContent(type="text", text=f"Unknown tool: {name}")],
             isError=True
+        )
+    
+    async def _handle_send_task_input(self, arguments: dict) -> CallToolResult:
+        """Handle send_task_input tool call to resume a waiting task."""
+        task_id = arguments.get("task_id")
+        data = arguments.get("data", {})
+        
+        if not task_id:
+            return CallToolResult(
+                content=[TextContent(type="text", text="Missing required parameter: task_id")],
+                isError=True
+            )
+        
+        # Send the input (raises DTS external event)
+        # This works even after server restart - DTS tracks orchestration state
+        try:
+            self._store.send_input(task_id, data)
+        except Exception as e:
+            return CallToolResult(
+                content=[TextContent(type="text", text=f"Failed to send input to task {task_id}: {e}")],
+                isError=True
+            )
+        
+        # Wait for orchestration to complete (poll DTS)
+        import time
+        max_wait = 30  # seconds
+        poll_interval = 0.5
+        elapsed = 0
+        
+        while elapsed < max_wait:
+            await asyncio.sleep(poll_interval)
+            elapsed += poll_interval
+            
+            task = await self._store.get_task(task_id)
+            if task and task.status == "completed":
+                # Get the result
+                result = await self._store.get_result(task_id)
+                if result and result.content:
+                    return CallToolResult(
+                        content=[TextContent(type="text", text=f"Task completed!\n\nResult: {result.content[0].text}")]
+                    )
+                return CallToolResult(
+                    content=[TextContent(type="text", text=f"Task {task_id} completed.")]
+                )
+            elif task and task.status == "failed":
+                return CallToolResult(
+                    content=[TextContent(type="text", text=f"Task {task_id} failed: {task.statusMessage}")],
+                    isError=True
+                )
+        
+        return CallToolResult(
+            content=[TextContent(type="text", text=f"Input sent to task {task_id}. Task is still processing (check status later).")]
         )
     
     def run(self, host: str = "0.0.0.0", port: int = 3000):

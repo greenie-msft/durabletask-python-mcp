@@ -1,18 +1,3 @@
-"""
-Example: Adding DTS support to an EXISTING MCP server.
-
-This demonstrates how to add Durable Tasks support to an MCP server
-that already has other tools/resources defined.
-
-DurableTasks automatically registers handlers that chain to any existing ones,
-so you don't need to manually combine tools - just wrap your server!
-
-Usage:
-    1. Start DTS emulator: docker run -d -p 8080:8080 -p 8082:8082 cgillum/durabletask-emulator
-    2. Run this server: python server.py
-    3. Run the client: python client.py
-"""
-
 import asyncio
 from mcp.server import Server
 from mcp.server.sse import SseServerTransport
@@ -29,12 +14,15 @@ mcp_server = Server("my-existing-server")
 # Add DTS support
 durable_mcp_server = DurableTasks(mcp_server, dts_host="localhost:8080")
 
+# Create human-in-the-loop helper
+wait_for_approval = durable_mcp_server.create_input_waiter("approval")
+
 
 # ----- Define task-backed tools -----
 
 @durable_mcp_server.task(
-    name="long_running_analysis",
-    description="Run a long analysis job",
+    name="analysis_with_approval",
+    description="Run analysis that requires human approval before completing",
     input_schema={
         "type": "object",
         "properties": {
@@ -43,20 +31,51 @@ durable_mcp_server = DurableTasks(mcp_server, dts_host="localhost:8080")
         }
     }
 )
-def analysis_orchestration(ctx, input: dict):
-    """Orchestration for long-running analysis."""
-    # NOTE: Don't use random.randint() here - DTS orchestrations must be deterministic!
-    # Each replay would get a different value, causing infinite loops.
-    num_steps = input.get("steps", 5)  # Get from input instead
+def approval_orchestration(ctx, input: dict):
+    """
+    Orchestration that demonstrates human-in-the-loop.
+    """
+    num_steps = input.get("steps", 5)
+    query = input.get("query", "data")
+    
+    # Phase 1: Initial analysis
     results = []
     for i in range(num_steps):
         result = yield ctx.call_activity(do_analysis, input={
-            "query": input.get("query", ""),
+            "query": query,
             "step": i + 1,
             "total": num_steps
         })
         results.append(result)
-    return {"analysis_complete": True, "steps": num_steps, "results": results}
+    
+    # Phase 2: Request human approval
+    # Marks the task as "input_required" and durably waits until input arrives
+    approval = yield from wait_for_approval(
+        ctx,
+        message=f"Analysis complete. {num_steps} steps processed. Please approve to continue.",
+        data={"results": results},
+    )
+    
+    # Phase 3: Handle approval/rejection
+    if approval and approval.get("approved"):
+        # Run final processing
+        final = yield ctx.call_activity(do_final_processing, input={
+            "results": results,
+            "approver": approval.get("approver", "unknown")
+        })
+        return {
+            "status": "completed",
+            "approved": True,
+            "initial_results": results,
+            "final_result": final
+        }
+    else:
+        return {
+            "status": "rejected",
+            "approved": False,
+            "reason": approval.get("reason", "No reason provided") if approval else "Approval timeout",
+            "initial_results": results
+        }
 
 
 @durable_mcp_server.activity
@@ -67,6 +86,16 @@ def do_analysis(ctx, input: dict):
     step = input.get("step", 1)
     total = input.get("total", 1)
     return f"Step {step}/{total}: Analyzed '{input.get('query', 'nothing')}'"
+
+
+@durable_mcp_server.activity
+def do_final_processing(ctx, input: dict):
+    """Activity that does final processing after approval."""
+    import time
+    time.sleep(1)  # Simulate work
+    results = input.get("results", [])
+    approver = input.get("approver", "unknown")
+    return f"Final processing complete. {len(results)} results approved by {approver}."
 
 
 # ----- Run the server -----
